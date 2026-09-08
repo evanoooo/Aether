@@ -119,78 +119,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          PATCH_SRC="$(pwd)/.github/patches/custom_bind_host.patch"
-          if [[ ! -f "${PATCH_SRC}" ]]; then
-            PATCH_SRC="$(pwd)/custom_bind_host.patch"
-          fi
-          if [[ ! -f "${PATCH_SRC}" ]]; then
-            echo "Error: Patch file not found!" >&2
-            exit 1
-          fi
-
-          cp "${PATCH_SRC}" "${RUNNER_TEMP}/custom_bind_host.patch"
-
-          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
-          git fetch upstream "refs/tags/${TARGET_TAG}:refs/tags/${TARGET_TAG}"
-
-          git checkout -B "sync-release-${TARGET_TAG}" "refs/tags/${TARGET_TAG}"
-
-          if ! grep -q "APP_HOST" apps/aether-gateway/src/main.rs; then
-            echo "Applying custom bind host patch on ${TARGET_TAG}..."
-            if ! git apply "${RUNNER_TEMP}/custom_bind_host.patch"; then
-              echo "Standard git apply failed, trying with whitespace ignore..."
-              if ! git apply --ignore-whitespace --ignore-space-change "${RUNNER_TEMP}/custom_bind_host.patch"; then
-                echo "Falling back to smart node script replacement..."
-                node -e '
-                  const fs = require("fs");
-                  const file = "apps/aether-gateway/src/main.rs";
-                  let content = fs.readFileSync(file, "utf8");
-                  const original = `fn gateway_bind_addr(app_port: u16) -> Result<std::net::SocketAddr, std::io::Error> {
-    Ok(std::net::SocketAddr::from((
-        [0, 0, 0, 0],
-        validate_app_port(app_port)?,
-    )))
-}`;
-                  const replacement = `fn gateway_bind_addr(app_port: u16) -> Result<std::net::SocketAddr, std::io::Error> {
-    let host_str = std::env::var("APP_HOST")
-        .or_else(|_| std::env::var("AETHER_BIND_ADDR"))
-        .unwrap_or_else(|_| "0.0.0.0".to_string());
-    let ip: std::net::IpAddr = host_str.trim().parse().map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("Invalid bind IP \x27{host_str}\x27: {e}"),
-        )
-    })?;
-    Ok(std::net::SocketAddr::new(ip, validate_app_port(app_port)?))
-}`;
-                  if (content.includes(original)) {
-                    content = content.replace(original, replacement);
-                    fs.writeFileSync(file, content, "utf8");
-                    console.log("Replacement applied successfully.");
-                  } else {
-                    console.error("Function pattern not found!");
-                    process.exit(1);
-                  }
-                '
-              fi
-            fi
-          else
-            echo "Code already contains APP_HOST patch."
-          fi
-
-          if ! grep -q "APP_HOST" apps/aether-gateway/src/main.rs; then
-            echo "Error: APP_HOST still not found in apps/aether-gateway/src/main.rs" >&2
-            exit 1
-          fi
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git commit -am "feat(gateway): bind host via APP_HOST/AETHER_BIND_ADDR env for ${TARGET_TAG}" || echo "No changes to commit"
-
-          git tag -f -a "${TARGET_TAG}" -m "Release ${TARGET_TAG} with custom bind host"
-          git push origin "${TARGET_TAG}" --force
-          echo "Successfully updated and pushed tag ${TARGET_TAG} to origin."
+          cp .github/scripts/apply-patch.sh "${RUNNER_TEMP}/apply-patch.sh"
+          cp .github/patches/custom_bind_host.patch "${RUNNER_TEMP}/custom_bind_host.patch"
+          chmod +x "${RUNNER_TEMP}/apply-patch.sh"
+          PATCH_FILE="${RUNNER_TEMP}/custom_bind_host.patch" "${RUNNER_TEMP}/apply-patch.sh"
 
   frontend:
     name: Build frontend
