@@ -1,4 +1,4 @@
-name: Release Aether (Linux)
+name: 自动检测上游发版并发布 (Sync Upstream & Release)
 
 on:
   schedule:
@@ -31,7 +31,7 @@ env:
 
 jobs:
   prepare:
-    name: Check upstream & prepare tag
+    name: 检查上游发版并合并补丁 (Check Upstream & Sync)
     runs-on: ubuntu-latest
     outputs:
       should_release: ${{ steps.decide.outputs.should_release }}
