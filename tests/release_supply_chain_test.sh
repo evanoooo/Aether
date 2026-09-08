@@ -41,8 +41,6 @@ assert_line "${RELEASE_WORKFLOW}" "      attestations: write"
 assert_line "${RELEASE_WORKFLOW}" "      id-token: write"
 assert_line "${RELEASE_WORKFLOW}" \
     "        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2"
-assert_line "${RELEASE_WORKFLOW}" '          subject-digest: ${{ steps.push.outputs.digest }}'
-assert_line "${RELEASE_WORKFLOW}" "          push-to-registry: true"
 assert_line "${RELEASE_WORKFLOW}" "          subject-path: |"
 assert_line "${RELEASE_WORKFLOW}" "            release-assets/install.sh"
 assert_line "${RELEASE_WORKFLOW}" "            release-assets/SHA256SUMS"

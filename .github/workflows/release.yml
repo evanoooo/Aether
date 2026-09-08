@@ -1,76 +1,206 @@
-name: Release Aether
+name: Release Aether (Linux)
 
 on:
+  schedule:
+    - cron: '0 */2 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Specify tag to release (e.g. v0.7.16). Leave blank to auto-detect upstream latest.'
+        required: false
+        default: ''
+      force:
+        description: 'Force release even if tag already exists in this repository'
+        type: boolean
+        default: false
   push:
     tags: ['v*']
-  workflow_dispatch:
 
 permissions:
   actions: read
-  contents: read
+  contents: write
+  attestations: write
+  id-token: write
 
 concurrency:
-  group: release-aether-${{ github.ref }}
+  group: release-aether-sync
   cancel-in-progress: false
 
 env:
-  REGISTRY: ghcr.io
-  GHCR_IMAGE: fawney19/aether
-  DOCKERHUB_IMAGE: fawney19/aether
+  UPSTREAM_REPO: fawney19/Aether
 
 jobs:
-  preflight:
-    name: Release preflight
+  prepare:
+    name: Check upstream & prepare tag
     runs-on: ubuntu-latest
     outputs:
-      publish: ${{ steps.classify.outputs.publish }}
-      version_tag: ${{ steps.classify.outputs.version_tag }}
-      prerelease: ${{ steps.classify.outputs.prerelease }}
-      make_latest: ${{ steps.classify.outputs.make_latest }}
+      should_release: ${{ steps.decide.outputs.should_release }}
+      version_tag: ${{ steps.decide.outputs.version_tag }}
+      prerelease: ${{ steps.decide.outputs.prerelease }}
+      make_latest: ${{ steps.decide.outputs.make_latest }}
     steps:
-      - name: Classify release tag
-        id: classify
+      - name: Checkout repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Determine target release and check upstream
+        id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          UPSTREAM_REPO: ${{ env.UPSTREAM_REPO }}
+          INPUT_TAG: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "publish=false" >> "${GITHUB_OUTPUT}"
+          echo "Event: ${GITHUB_EVENT_NAME}"
+          echo "should_release=false" >> "${GITHUB_OUTPUT}"
           echo "version_tag=" >> "${GITHUB_OUTPUT}"
           echo "prerelease=false" >> "${GITHUB_OUTPUT}"
           echo "make_latest=false" >> "${GITHUB_OUTPUT}"
 
-          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
-            echo "Manual release build; publish jobs will be skipped."
-            exit 0
+          TARGET_TAG=""
+
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            TARGET_TAG="${GITHUB_REF_NAME}"
+            echo "Push event for tag: ${TARGET_TAG}"
+          elif [[ -n "${INPUT_TAG}" ]]; then
+            TARGET_TAG="${INPUT_TAG}"
+            echo "Manual workflow_dispatch with specified tag: ${TARGET_TAG}"
+          else
+            echo "Checking upstream ${UPSTREAM_REPO} for releases..."
+            UPSTREAM_TAG="$(gh api "repos/${UPSTREAM_REPO}/releases?per_page=30" --jq '[.[] | select(.draft == false and (.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+(-(beta|rc)\\.[0-9]+)?$")))] | .[0].tag_name')"
+
+            if [[ -z "${UPSTREAM_TAG}" || "${UPSTREAM_TAG}" == "null" ]]; then
+              echo "Error: No valid release found in upstream ${UPSTREAM_REPO}" >&2
+              exit 1
+            fi
+            TARGET_TAG="${UPSTREAM_TAG}"
+            echo "Latest upstream tag found: ${TARGET_TAG}"
           fi
 
-          tag="${GITHUB_REF_NAME}"
-          if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(beta|rc)\.[0-9]+)?$ ]]; then
-            echo "Unsupported release tag: ${tag}" >&2
-            echo "Expected vX.Y.Z, vX.Y.Z-beta.N, or vX.Y.Z-rc.N." >&2
+          if [[ ! "${TARGET_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(beta|rc)\.[0-9]+)?$ ]]; then
+            echo "Unsupported release tag format: ${TARGET_TAG}" >&2
+            echo "Expected vX.Y.Z, vX.Y.Z-beta.N, or vX.Y.Z-rc.N" >&2
             exit 1
           fi
 
-          echo "version_tag=${tag}" >> "${GITHUB_OUTPUT}"
+          EXISTS_IN_LOCAL="false"
+          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TARGET_TAG}" >/dev/null 2>&1; then
+            EXISTS_IN_LOCAL="true"
+          fi
 
-          if [[ "${tag}" == *-* ]]; then
+          if [[ "${EXISTS_IN_LOCAL}" == "true" && "${FORCE}" != "true" && "${GITHUB_EVENT_NAME}" != "push" ]]; then
+            echo "Release ${TARGET_TAG} already exists in ${GITHUB_REPOSITORY}. Skipping release."
+            exit 0
+          fi
+
+          echo "Target tag to release: ${TARGET_TAG}"
+          echo "should_release=true" >> "${GITHUB_OUTPUT}"
+          echo "version_tag=${TARGET_TAG}" >> "${GITHUB_OUTPUT}"
+
+          if [[ "${TARGET_TAG}" == *-* ]]; then
             echo "prerelease=true" >> "${GITHUB_OUTPUT}"
+            echo "make_latest=false" >> "${GITHUB_OUTPUT}"
           else
+            echo "prerelease=false" >> "${GITHUB_OUTPUT}"
             echo "make_latest=true" >> "${GITHUB_OUTPUT}"
           fi
 
-          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
-            echo "publish=true" >> "${GITHUB_OUTPUT}"
-          else
-            echo "Manual release build for ${tag}; publish jobs will be skipped."
+      - name: Apply IP bind patch and push release tag
+        if: steps.decide.outputs.should_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          TARGET_TAG: ${{ steps.decide.outputs.version_tag }}
+          UPSTREAM_REPO: ${{ env.UPSTREAM_REPO }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PATCH_SRC="$(pwd)/.github/patches/custom_bind_host.patch"
+          if [[ ! -f "${PATCH_SRC}" ]]; then
+            PATCH_SRC="$(pwd)/custom_bind_host.patch"
           fi
+          if [[ ! -f "${PATCH_SRC}" ]]; then
+            echo "Error: Patch file not found!" >&2
+            exit 1
+          fi
+
+          cp "${PATCH_SRC}" "${RUNNER_TEMP}/custom_bind_host.patch"
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
+          git fetch upstream "refs/tags/${TARGET_TAG}:refs/tags/${TARGET_TAG}"
+
+          git checkout -B "sync-release-${TARGET_TAG}" "refs/tags/${TARGET_TAG}"
+
+          if ! grep -q "APP_HOST" apps/aether-gateway/src/main.rs; then
+            echo "Applying custom bind host patch on ${TARGET_TAG}..."
+            if ! git apply "${RUNNER_TEMP}/custom_bind_host.patch"; then
+              echo "Standard git apply failed, trying with whitespace ignore..."
+              if ! git apply --ignore-whitespace --ignore-space-change "${RUNNER_TEMP}/custom_bind_host.patch"; then
+                echo "Falling back to smart node script replacement..."
+                node -e '
+                  const fs = require("fs");
+                  const file = "apps/aether-gateway/src/main.rs";
+                  let content = fs.readFileSync(file, "utf8");
+                  const original = `fn gateway_bind_addr(app_port: u16) -> Result<std::net::SocketAddr, std::io::Error> {
+    Ok(std::net::SocketAddr::from((
+        [0, 0, 0, 0],
+        validate_app_port(app_port)?,
+    )))
+}`;
+                  const replacement = `fn gateway_bind_addr(app_port: u16) -> Result<std::net::SocketAddr, std::io::Error> {
+    let host_str = std::env::var("APP_HOST")
+        .or_else(|_| std::env::var("AETHER_BIND_ADDR"))
+        .unwrap_or_else(|_| "0.0.0.0".to_string());
+    let ip: std::net::IpAddr = host_str.trim().parse().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Invalid bind IP \x27{host_str}\x27: {e}"),
+        )
+    })?;
+    Ok(std::net::SocketAddr::new(ip, validate_app_port(app_port)?))
+}`;
+                  if (content.includes(original)) {
+                    content = content.replace(original, replacement);
+                    fs.writeFileSync(file, content, "utf8");
+                    console.log("Replacement applied successfully.");
+                  } else {
+                    console.error("Function pattern not found!");
+                    process.exit(1);
+                  }
+                '
+              fi
+            fi
+          else
+            echo "Code already contains APP_HOST patch."
+          fi
+
+          if ! grep -q "APP_HOST" apps/aether-gateway/src/main.rs; then
+            echo "Error: APP_HOST still not found in apps/aether-gateway/src/main.rs" >&2
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -am "feat(gateway): bind host via APP_HOST/AETHER_BIND_ADDR env for ${TARGET_TAG}" || echo "No changes to commit"
+
+          git tag -f -a "${TARGET_TAG}" -m "Release ${TARGET_TAG} with custom bind host"
+          git push origin "${TARGET_TAG}" --force
+          echo "Successfully updated and pushed tag ${TARGET_TAG} to origin."
 
   frontend:
     name: Build frontend
-    needs: preflight
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.prepare.outputs.version_tag }}
 
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -101,74 +231,10 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  vscodex:
-    name: Build VS Code Codex extension
-    needs: preflight
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-
-      - name: Setup Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: |
-            aether-vscodex/package-lock.json
-            aether-vscodex/web/package-lock.json
-            aether-vscodex/vscode-extension/package-lock.json
-
-      - name: Install module test dependencies
-        working-directory: aether-vscodex
-        run: npm ci
-
-      - name: Build the embedded Web UI
-        working-directory: aether-vscodex/web
-        run: |
-          npm ci
-          npm run build
-
-      - name: Install extension dependencies
-        working-directory: aether-vscodex/vscode-extension
-        run: npm ci
-
-      - name: Check and compile the extension
-        working-directory: aether-vscodex/vscode-extension
-        run: |
-          npm run check
-          npm run build
-
-      - name: Run module tests
-        working-directory: aether-vscodex
-        run: npm test
-
-      - name: Run Web UI tests
-        working-directory: aether-vscodex/web
-        run: npm test
-
-      - name: Package VSIX
-        working-directory: aether-vscodex/vscode-extension
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="$(node -p "require('./package.json').version")"
-          npx --yes @vscode/vsce package --no-update-package-json --allow-missing-repository
-          source_vsix="codex-remote-collab-${version}.vsix"
-          test -f "${source_vsix}"
-          mv "${source_vsix}" "aether-vscodex-${version}.vsix"
-          unzip -l "aether-vscodex-${version}.vsix" | grep 'extension/node_modules/ws/index.js' >/dev/null
-
-      - name: Upload VSIX artifact
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
-        with:
-          name: aether-vscodex-vsix
-          path: aether-vscodex/vscode-extension/aether-vscodex-*.vsix
-          if-no-files-found: error
-          retention-days: 7
-
   build:
     name: Build ${{ matrix.name }}
-    needs: preflight
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: true
@@ -186,20 +252,10 @@ jobs:
             arch: arm64
             os: ubuntu-latest
             use_cross: true
-          - name: macos-amd64
-            target: x86_64-apple-darwin
-            platform: macos
-            arch: amd64
-            os: macos-15-intel
-            use_cross: false
-          - name: macos-arm64
-            target: aarch64-apple-darwin
-            platform: macos
-            arch: arm64
-            os: macos-15
-            use_cross: false
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.prepare.outputs.version_tag }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
@@ -218,7 +274,7 @@ jobs:
 
       - name: Build
         env:
-          AETHER_VERSION: ${{ needs.preflight.outputs.version_tag }}
+          AETHER_VERSION: ${{ needs.prepare.outputs.version_tag }}
           AETHER_BUILD_TYPE: release
           CARGO_TERM_COLOR: always
         shell: bash
@@ -237,99 +293,10 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  docker:
-    name: Docker multi-arch
-    needs: [preflight, frontend, build]
-    if: needs.preflight.outputs.publish == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      attestations: write
-      contents: read
-      id-token: write
-      packages: write
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
-        with:
-          path: artifacts
-
-      - name: Prepare dist layout
-        run: |
-          mkdir -p dist
-          cp artifacts/aether-gateway-linux-amd64/aether-gateway dist/aether-gateway-amd64
-          cp artifacts/aether-gateway-linux-arm64/aether-gateway dist/aether-gateway-arm64
-          chmod +x dist/aether-gateway-amd64 dist/aether-gateway-arm64
-          cp -r artifacts/frontend-dist dist/frontend
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
-        with:
-          images: |
-            ${{ env.REGISTRY }}/${{ env.GHCR_IMAGE }}
-            docker.io/${{ env.DOCKERHUB_IMAGE }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}},enable=${{ needs.preflight.outputs.make_latest == 'true' }}
-            type=raw,value=latest,enable=${{ needs.preflight.outputs.make_latest == 'true' }}
-            type=raw,value=beta,enable=${{ contains(github.ref_name, '-beta.') }}
-            type=raw,value=rc,enable=${{ contains(github.ref_name, '-rc.') }}
-            type=sha,prefix=
-          flavor: |
-            latest=false
-
-      - name: Build and push
-        id: push
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          file: ./Dockerfile.app
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          platforms: linux/amd64,linux/arm64
-
-      - name: Attest GHCR image provenance
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-name: ${{ env.REGISTRY }}/${{ env.GHCR_IMAGE }}
-          subject-digest: ${{ steps.push.outputs.digest }}
-          push-to-registry: true
-          create-storage-record: false
-
-      - name: Attest Docker Hub image provenance
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-name: docker.io/${{ env.DOCKERHUB_IMAGE }}
-          subject-digest: ${{ steps.push.outputs.digest }}
-          push-to-registry: true
-          create-storage-record: false
-
   package:
     name: Release tarballs
-    needs: [preflight, frontend, build]
+    needs: [prepare, frontend, build]
+    if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -338,6 +305,8 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.prepare.outputs.version_tag }}
 
       - name: Download all artifacts
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
@@ -345,18 +314,14 @@ jobs:
           path: artifacts
 
       - name: Build release packages
+        env:
+          VERSION: ${{ needs.prepare.outputs.version_tag }}
         run: |
           set -euo pipefail
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            VERSION="${GITHUB_REF_NAME}"
-            SOURCE_REF="${GITHUB_REF_NAME}"
-          else
-            VERSION="snapshot-${GITHUB_SHA::7}"
-            SOURCE_REF="${GITHUB_SHA}"
-          fi
+          SOURCE_REF="${VERSION}"
 
           mkdir -p package release-assets
-          for platform in linux macos; do
+          for platform in linux; do
             for arch in amd64 arm64; do
               bundle="aether-${VERSION}-${platform}-${arch}"
               root="package/${bundle}"
@@ -367,6 +332,7 @@ jobs:
               install -m 0755 "artifacts/aether-gateway-${platform}-${arch}/aether-gateway" "${root}/bin/aether-gateway"
               cp -R artifacts/frontend-dist/. "${root}/frontend/"
               sed \
+                -e "s|^REPO=\"\${AETHER_REPO:-.*}\"|REPO=\"\${AETHER_REPO:-${GITHUB_REPOSITORY}}\"|" \
                 -e "s/^SOURCE_REF=\"\${AETHER_SOURCE_REF:-main}\"/SOURCE_REF=\"\${AETHER_SOURCE_REF:-${SOURCE_REF}}\"/" \
                 -e "s/^VERSION=\"\${AETHER_VERSION:-}\"/VERSION=\"\${AETHER_VERSION:-${VERSION}}\"/" \
                 install.sh > "${root}/install.sh"
@@ -384,6 +350,7 @@ jobs:
           done
 
           sed \
+            -e "s|^REPO=\"\${AETHER_REPO:-.*}\"|REPO=\"\${AETHER_REPO:-${GITHUB_REPOSITORY}}\"|" \
             -e "s/^SOURCE_REF=\"\${AETHER_SOURCE_REF:-main}\"/SOURCE_REF=\"\${AETHER_SOURCE_REF:-${SOURCE_REF}}\"/" \
             -e "s/^VERSION=\"\${AETHER_VERSION:-}\"/VERSION=\"\${AETHER_VERSION:-${VERSION}}\"/" \
             install.sh > release-assets/install.sh
@@ -392,7 +359,7 @@ jobs:
 
       - name: Attest release package provenance
         id: attest-release
-        if: needs.preflight.outputs.publish == 'true'
+        continue-on-error: true
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: |
@@ -401,10 +368,15 @@ jobs:
             release-assets/SHA256SUMS
 
       - name: Bundle release package provenance
-        if: needs.preflight.outputs.publish == 'true'
+        continue-on-error: true
         env:
           ATTESTATION_BUNDLE: ${{ steps.attest-release.outputs.bundle-path }}
-        run: install -m 0644 "${ATTESTATION_BUNDLE}" release-assets/AETHER_RELEASE_PROVENANCE.sigstore.json
+        run: |
+          if [[ -n "${ATTESTATION_BUNDLE:-}" && -f "${ATTESTATION_BUNDLE:-}" ]]; then
+            install -m 0644 "${ATTESTATION_BUNDLE}" release-assets/AETHER_RELEASE_PROVENANCE.sigstore.json
+          else
+            echo "{}" > release-assets/AETHER_RELEASE_PROVENANCE.sigstore.json
+          fi
 
       - name: Upload release package artifact
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
@@ -416,8 +388,8 @@ jobs:
 
   github-release:
     name: GitHub Release assets
-    needs: [preflight, docker, package, vscodex]
-    if: needs.preflight.outputs.publish == 'true'
+    needs: [prepare, package]
+    if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -429,21 +401,15 @@ jobs:
           name: release-assets
           path: release-assets
 
-      - name: Download VSIX artifact
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
-        with:
-          name: aether-vscodex-vsix
-          path: release-assets
-
       - name: Delete stale draft releases for tag
         env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.version_tag }}
           REPOSITORY: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
-          draft_ids="$(gh api "repos/${REPOSITORY}/releases" --paginate --jq '.[] | select(.tag_name == env.RELEASE_TAG and .draft == true) | .id')"
+          draft_ids="$(gh api "repos/${REPOSITORY}/releases" --paginate --jq '.[] | select(.tag_name == env.RELEASE_TAG and .draft == true) | .id' 2>/dev/null || true)"
 
           if [[ -z "${draft_ids}" ]]; then
             echo "No stale draft releases for ${RELEASE_TAG}"
@@ -459,12 +425,12 @@ jobs:
       - name: Publish GitHub Release assets
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
+          tag_name: ${{ needs.prepare.outputs.version_tag }}
           generate_release_notes: true
-          prerelease: ${{ needs.preflight.outputs.prerelease }}
-          make_latest: ${{ needs.preflight.outputs.make_latest }}
+          prerelease: ${{ needs.prepare.outputs.prerelease }}
+          make_latest: ${{ needs.prepare.outputs.make_latest }}
           files: |
             release-assets/*.tar.gz
             release-assets/AETHER_RELEASE_PROVENANCE.sigstore.json
             release-assets/SHA256SUMS
             release-assets/install.sh
-            release-assets/*.vsix

@@ -1,0 +1,25 @@
+diff --git a/apps/aether-gateway/src/main.rs b/apps/aether-gateway/src/main.rs
+index 0721a9d5d..5f24bf91b 100644
+--- a/apps/aether-gateway/src/main.rs
++++ b/apps/aether-gateway/src/main.rs
+@@ -1733,10 +1733,16 @@ fn validate_app_port(app_port: u16) -> Result<u16, std::io::Error> {
+ }
+ 
+ fn gateway_bind_addr(app_port: u16) -> Result<std::net::SocketAddr, std::io::Error> {
+-    Ok(std::net::SocketAddr::from((
+-        [0, 0, 0, 0],
+-        validate_app_port(app_port)?,
+-    )))
++    let host_str = std::env::var("APP_HOST")
++        .or_else(|_| std::env::var("AETHER_BIND_ADDR"))
++        .unwrap_or_else(|_| "0.0.0.0".to_string());
++    let ip: std::net::IpAddr = host_str.trim().parse().map_err(|e| {
++        std::io::Error::new(
++            std::io::ErrorKind::InvalidInput,
++            format!("Invalid bind IP '{host_str}': {e}"),
++        )
++    })?;
++    Ok(std::net::SocketAddr::new(ip, validate_app_port(app_port)?))
+ }
+ 
+ fn gateway_listen_backlog(backlog: i32) -> i32 {
