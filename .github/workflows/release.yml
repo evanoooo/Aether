@@ -31,7 +31,7 @@ env:
 
 jobs:
   release:
-    name: 构建并发布 Aether Linux 版本
+    name: 构建并发布 Aether Linux amd64 版本
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -146,14 +146,14 @@ jobs:
         if: steps.decide.outputs.should_release == 'true'
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
-          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+          targets: x86_64-unknown-linux-musl
 
       - name: Rust cache
         if: steps.decide.outputs.should_release == 'true'
         uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
-          shared-key: release-linux-musl
-          workspaces: . -> target
+          shared-key: release-amd64-cargo-registry
+          cache-targets: "false"
 
       - name: Install cross
         if: steps.decide.outputs.should_release == 'true'
@@ -167,17 +167,8 @@ jobs:
           CARGO_TERM_COLOR: always
         shell: bash
         run: |
+          rm -rf target
           cross build --release --locked -p aether-gateway --target x86_64-unknown-linux-musl
-
-      - name: Build Linux arm64 binary
-        if: steps.decide.outputs.should_release == 'true'
-        env:
-          AETHER_VERSION: ${{ steps.decide.outputs.version_tag }}
-          AETHER_BUILD_TYPE: release
-          CARGO_TERM_COLOR: always
-        shell: bash
-        run: |
-          cross build --release --locked -p aether-gateway --target aarch64-unknown-linux-musl
 
       - name: Build release packages
         if: steps.decide.outputs.should_release == 'true'
@@ -188,34 +179,27 @@ jobs:
           SOURCE_REF="${VERSION}"
 
           mkdir -p package release-assets
-          for arch in amd64 arm64; do
-            if [[ "${arch}" == "amd64" ]]; then
-              target_triple="x86_64-unknown-linux-musl"
-            else
-              target_triple="aarch64-unknown-linux-musl"
-            fi
-            bundle="aether-${VERSION}-linux-${arch}"
-            root="package/${bundle}"
-            mkdir -p "${root}/bin" "${root}/frontend"
+          bundle="aether-${VERSION}-linux-amd64"
+          root="package/${bundle}"
+          mkdir -p "${root}/bin" "${root}/frontend"
 
-            install -m 0755 "target/${target_triple}/release/aether-gateway" "${root}/bin/aether-gateway"
-            cp -R frontend/dist/. "${root}/frontend/"
-            sed \
-              -e "s|^REPO=\"\${AETHER_REPO:-.*}\"|REPO=\"\${AETHER_REPO:-${GITHUB_REPOSITORY}}\"|" \
-              -e "s/^SOURCE_REF=\"\${AETHER_SOURCE_REF:-main}\"/SOURCE_REF=\"\${AETHER_SOURCE_REF:-${SOURCE_REF}}\"/" \
-              -e "s/^VERSION=\"\${AETHER_VERSION:-}\"/VERSION=\"\${AETHER_VERSION:-${VERSION}}\"/" \
-              install.sh > "${root}/install.sh"
-            chmod 0755 "${root}/install.sh"
-            install -m 0755 update.sh "${root}/update.sh"
-            install -m 0644 docker-compose.yml "${root}/docker-compose.yml"
-            install -m 0644 docker-compose.single-node.yml "${root}/docker-compose.single-node.yml"
-            install -m 0644 .env.example "${root}/.env.example"
-            install -m 0755 generate_keys.sh "${root}/generate_keys.sh"
-            install -m 0644 README.md "${root}/README.md"
-            install -m 0644 LICENSE "${root}/LICENSE"
+          install -m 0755 "target/x86_64-unknown-linux-musl/release/aether-gateway" "${root}/bin/aether-gateway"
+          cp -R frontend/dist/. "${root}/frontend/"
+          sed \
+            -e "s|^REPO=\"\${AETHER_REPO:-.*}\"|REPO=\"\${AETHER_REPO:-${GITHUB_REPOSITORY}}\"|" \
+            -e "s/^SOURCE_REF=\"\${AETHER_SOURCE_REF:-main}\"/SOURCE_REF=\"\${AETHER_SOURCE_REF:-${SOURCE_REF}}\"/" \
+            -e "s/^VERSION=\"\${AETHER_VERSION:-}\"/VERSION=\"\${AETHER_VERSION:-${VERSION}}\"/" \
+            install.sh > "${root}/install.sh"
+          chmod 0755 "${root}/install.sh"
+          install -m 0755 update.sh "${root}/update.sh"
+          install -m 0644 docker-compose.yml "${root}/docker-compose.yml"
+          install -m 0644 docker-compose.single-node.yml "${root}/docker-compose.single-node.yml"
+          install -m 0644 .env.example "${root}/.env.example"
+          install -m 0755 generate_keys.sh "${root}/generate_keys.sh"
+          install -m 0644 README.md "${root}/README.md"
+          install -m 0644 LICENSE "${root}/LICENSE"
 
-            tar -C package -czf "release-assets/${bundle}.tar.gz" "${bundle}"
-          done
+          tar -C package -czf "release-assets/${bundle}.tar.gz" "${bundle}"
 
           sed \
             -e "s|^REPO=\"\${AETHER_REPO:-.*}\"|REPO=\"\${AETHER_REPO:-${GITHUB_REPOSITORY}}\"|" \
